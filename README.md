@@ -1,11 +1,13 @@
+cd /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite
+sudo rm -rf build/
 west build -p auto -b pico_pi_m4 remote_echo 
+
 -- west build: generating a build system
 CMake Warning at /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/cmake/app/boilerplate.cmake:20 (message):
   Loading of Zephyr boilerplate.cmake directly is deprecated, please use
   'find_package(Zephyr)'
 Call Stack (most recent call first):
   CMakeLists.txt:4 (include)
-
 
 Loading Zephyr default modules (Zephyr base).
 -- Application: /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo
