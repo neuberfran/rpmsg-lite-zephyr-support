@@ -1,85 +1,135 @@
-RPMsg Component
-===============
-
-This documentation describes the RPMsg-Lite component which is a lightweight implementation of the Remote Processor Messaging (RPMsg) protocol. The RPMsg protocol defines a standardized binary interface used to communicate between multiple cores in a heterogeneous multicore system.
-
-Compared to the RPMsg implementation of the Open Asymmetric Multi Processing (OpenAMP) framework (https://github.com/OpenAMP/open-amp), the RPMsg-Lite offers a code size reduction, API simplification and improved modularity. On smaller Cortex-M0+ based systems, it is recommended to use RPMsg-Lite.
-
-The RPMsg-Lite is an open-source component developed by NXP Semiconductor and released under the BSD compatible license.
-
-For Further documentation, please look at doxygen documentation at: https://nxpmicro.github.io/rpmsg-lite/
-
-# Motivation to create RPMsg-Lite
-
-There are multiple reasons why RPMsg-Lite was developed. One of them is the need for small footprint RPMsg protocol compatible communication component, another is a simplification of extensive API of OpenAMP RPMsg implementation.
-
-Until recently, RPMsg protocol was not documented and its only definition was given by the Linux Kernel and legacy OpenAMP implementations. This changed with [1] which is a standardization protocol, allowing multiple different implementations to coexist and still be compatible mutually.
-
-Small MCU-based systems often do not implement dynamic memory allocation. The creation of static API in RPMsg-Lite enables another reduction of resource usage. Not only the dynamic allocation adds another 5kB of code size, but also the communication is slower and less deterministic, which is a property introduced by dynamic memory. Following table shows some rough comparison data between the OpenAMP RPMsg implementation and new RPMsg-Lite implementation:
-
-|Component / Configuration                   | Flash [B] |RAM [B]        |
-|---------------------------------------------|-----------|---------------|
-|OpenAMP RPMSG / Release (reference)          | 5547      | 456 + dynamic |
-|RPMSG-Lite / Dynamic API, Release            | 3462      | 56 + dynamic  |
-|Relative Difference [%]                      | ~62.4%    | ~12.3%        |
-|RPMSG-Lite / Static API (no malloc), Release | 2926      | 352           |
-|Relative Difference [%]                      | ~52.7%    | ~77.2%        |
-
-# Implementation
-
-The implementation of RPMsg-Lite can be divided into three sub-components, from which two are optional. The core component is situated in <i>rpmsg_lite.c</i>. Two optional components are used to implement a blocking receive API (in <i>rpmsg_queue.c</i>) and dynamic "named" endpoint creation and deletion announcement service (in <i>rpmsg_ns.c</i>).
-
-The actual "media access" layer is implemented in <i>virtqueue.c</i>, which is one of few files shared with the OpenAMP implementation. This layer mainly defines the shared memory model and defines internally used components such as vring or virtqueue.
-
-The porting layer is split into two sub-layers: the environment layer and the platform layer. The first one is to be implemented separately for each environment. (There already exist the bare-metal environment implemented in <i>env_bm.c</i> and the FreeRTOS environment implemented in <i>env_freertos.c</i> etc.) Only the source file which matches the used environment is included in the target application project. The second sublayer is implemented in <i>platform.c</i> and it defines low-level functions for interrupt enabling, disabling and triggering mainly. The situation is described in the following figure:
-
-![RPMsg-Lite Architecture](./doxygen/images/rpmsg_lite_arch.png)
-
-## RPMsg-Lite core sub-component
-
-This sub-component implements a blocking send API and callback-based receive API. RPMsg protocol is part of the transport layer. This is realized by using so-called endpoints. Each endpoint can be assigned a different receive callback function. It is however important to notice, that the callback is executed in an interrupt environment in current design. Certain actions like memory allocation is therefore discouraged to execute in the callback. Following figure shows the role of RPMsg in an ISO/OSI-like layered model:
-
-![RPMsg ISO/OSI Layered Model](./doxygen/images/rpmsg_isoosi.png)
-
-## Queue sub-component (optional)
-
-This sub-component is optional and it requires to implement env_*_queue() functions in the environment porting layer. It brings a blocking receive API which is common in RTOS-environments. It supports both copy and no-copy blocking receive functions.
-
-## Name Service sub-component (optional)
-
-This sub-component is a minimum implementation of the name service which is present in the Linux Kernel implementation of RPMsg. It allows the communicating node both to send announcements about "named" endpoint (a.k.a channel) creation or deletion and to receive these announcement taking any user-defined action in an application callback. The endpoint address used to receive name service announcements is arbitrarily fixed to be 53 (0x35).
-
-# Usage
-
-Your application should put the /rpmsg_lite/lib/include directory to the include path and then, in the application include either just rpmsg_lite.h header file, or optionally also rpmsg_queue.h and/or rpmsg_ns.h. Both porting sub-layers should be provided for you by NXP, but if you plan to use your own RTOS, all you need to do is to implement your own environment layer (i.e. env_myrtos.c) and to include it in the project build.
-
-The initialization of the stack is done by calling the rpmsg_lite_master_init() on the master side and the rpmsg_lite_remote_init() on the remote side. This initialization function must be called prior to any RPMsg-Lite API call. After the init, it is wise to create a communication endpoint, otherwise the communication is not possible. This can be done by calling rpmsg_lite_create_ept() function. It accepts optionally a last argument, where an internal context of the endpoint is created – just in case the RL_USE_STATIC_API option is set to 1. If not, the stack calls internally env_alloc() to allocate dynamic memory for it. In case a callback-based receiving is to be used, an ISR-callback is registered to each new endpoint with user-defined callback data pointer. If a blocking receive is desired (in case of RTOS environment), rpmsg_queue_create() function must be called before calling rpmsg_lite_create_ept(). The queue handle is passed to the endpoint creation function as a callback data argument and the callback function is set to rpmsg_queue_rx_cb(). Then, it is possible to use rpmsg_queue_receive() function to listen on a queue object for incoming messages. rpmsg_lite_send() function is used to send messages to the other side.
-
-The RPMsg-Lite also implements no-copy mechanisms for both sending and receiving operations. These methods require
-specifics that have to be considered when used in an application.
-
-<b>no-copy-send mechanism:</b> This mechanism allows sending messages without the cost for copying data from the application
-buffer to the RPMsg/virtio buffer in the shared memory. The sequence of no-copy sending steps to be performed is as follows:
-- Call the rpmsg_lite_alloc_tx_buffer() function to get the virtio buffer and provide the buffer pointer to the application.
-- Fill the data to be sent into the pre-allocated virtio buffer. Ensure that the filled data does not exceed the buffer size
-(provided as the rpmsg_lite_alloc_tx_buffer() <i>size</i> output parameter).
-- Call the rpmsg_lite_send_nocopy() function to send the message to the destination endpoint. Consider the cache
-functionality and the virtio buffer alignment. See the rpmsg_lite_send_nocopy() function description below.
-
-<b>no-copy-receive mechanism:</b> This mechanism allows reading messages without the cost for copying data from the virtio
-buffer in the shared memory to the application buffer. The sequence of no-copy receiving steps to be performed is as follows:
-- Call the rpmsg_queue_recv_nocopy() function to get the virtio buffer pointer to the received data.
-- Read received data directly from the shared memory.
-- Call the rpmsg_queue_nocopy_free() function to release the virtio buffer and to make it available for the next data transfer.
-
-The user is responsible for destroying any RPMsg-Lite objects he has created in case of deinitialization. For this, the function rpmsg_queue_destroy() is used to destroy a queue, rpmsg_lite_destroy_ept() is used to destroy an endpoint and finally, rpmsg_lite_deinit() is used to deinitialize the RPMsg-Lite intercore communication stack. Please take care to deinitialize all endpoints using a queue before deinitializing the queue, otherwise you are invalidating actively used queue handle, which is not allowed. RPMsg-Lite does not check this internally, since its main aim is to be lightweight.
-
-![RPMsg Lite copy and no-copy interface, multiple scenarios](./doxygen/images/rpmsg_lite_send_receive.png)
+west build -p auto -b pico_pi_m4 remote_echo 
+-- west build: generating a build system
+CMake Warning at /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/cmake/app/boilerplate.cmake:20 (message):
+  Loading of Zephyr boilerplate.cmake directly is deprecated, please use
+  'find_package(Zephyr)'
+Call Stack (most recent call first):
+  CMakeLists.txt:4 (include)
 
 
-# References
-[1] M. Novak, M. Cingel, Lockless Shared Memory Based Multicore Communication Protocol
+Loading Zephyr default modules (Zephyr base).
+-- Application: /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo
+-- CMake version: 3.24.1
+-- Found Python3: /usr/bin/python3.8 (found suitable exact version "3.8.10") found components: Interpreter 
+-- Cache files will be written to: /home/neuberfran/.cache/zephyr
+-- Zephyr version: 3.3.99 (/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr)
+-- Found west (found suitable version "1.0.0", minimum required is "0.7.1")
+-- Board: pico_pi_m4
+-- ZEPHYR_TOOLCHAIN_VARIANT not set, trying to locate Zephyr SDK
+-- Found host-tools: zephyr 0.16.0 (/home/neuberfran/zephyr-sdk-0.16.0)
+-- Found toolchain: zephyr 0.16.0 (/home/neuberfran/zephyr-sdk-0.16.0)
+-- Found Dtc: /home/neuberfran/zephyr-sdk-0.16.0/sysroots/x86_64-pokysdk-linux/usr/bin/dtc (found suitable version "1.6.0", minimum required is "1.4.6") 
+-- Found BOARD.dts: /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/boards/arm/pico_pi_m4/pico_pi_m4.dts
+-- Generated zephyr.dts: /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build/zephyr/zephyr.dts
+-- Generated devicetree_generated.h: /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build/zephyr/include/generated/devicetree_generated.h
+-- Including generated dts.cmake file: /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build/zephyr/dts.cmake
+Parsing /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo/Kconfig
+Loaded configuration '/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/boards/arm/pico_pi_m4/pico_pi_m4_defconfig'
+Merged configuration '/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo/prj.conf'
+Configuration saved to '/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build/zephyr/.config'
+Kconfig header saved to '/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build/zephyr/include/generated/autoconf.h'
+-- Found GnuLd: /home/neuberfran/zephyr-sdk-0.16.0/arm-zephyr-eabi/bin/../lib/gcc/arm-zephyr-eabi/12.2.0/../../../../arm-zephyr-eabi/bin/ld.bfd (found version "2.38") 
+-- The C compiler identification is GNU 12.2.0
+-- The CXX compiler identification is GNU 12.2.0
+-- The ASM compiler identification is GNU
+-- Found assembler: /home/neuberfran/zephyr-sdk-0.16.0/arm-zephyr-eabi/bin/arm-zephyr-eabi-gcc
+CMake Warning at /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/CMakeLists.txt:861 (message):
+  No SOURCES given to Zephyr library: drivers__clock_control
 
----
-Copyright © 2016 Freescale Semiconductor, Inc.
-# rpmsg-lite-zephyr-support
+  Excluding target from build.
+
+
+CMake Warning at /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/CMakeLists.txt:861 (message):
+  No SOURCES given to Zephyr library: drivers__ipm
+
+  Excluding target from build.
+
+
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build
+-- west build: building application
+[1/149] Preparing syscall dependency handling
+
+[3/149] Generating include/generated/version.h
+-- Zephyr version: 3.3.99 (/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr), build: zephyr-v3.3.0-4123-gd01780fc9403
+[13/149] Building C object CMakeFiles/app.dir/home/neuberfran/d..._lite/porting/platform/imx7d_m4/rpmsg_platform_zephyr_ipm.c.obj
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/platform/imx7d_m4/rpmsg_platform_zephyr_ipm.c: In function 'platform_init':
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/platform/imx7d_m4/rpmsg_platform_zephyr_ipm.c:249:16: warning: assignment discards 'const' qualifier from pointer target type [-Wdiscarded-qualifiers]
+  249 |     ipm_handle = device_get_binding("MU_B");
+      |                ^
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/platform/imx7d_m4/rpmsg_platform_zephyr_ipm.c:256:39: warning: passing argument 2 of 'ipm_register_callback' from incompatible pointer type [-Wincompatible-pointer-types]
+  256 |     ipm_register_callback(ipm_handle, platform_ipm_callback, NULL);
+      |                                       ^~~~~~~~~~~~~~~~~~~~~
+      |                                       |
+      |                                       void (*)(void *, uint32_t,  volatile void *) {aka void (*)(void *, unsigned int,  volatile void *)}
+In file included from /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/platform/imx7d_m4/rpmsg_platform_zephyr_ipm.c:42:
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/include/zephyr/drivers/ipm.h:166:57: note: expected 'ipm_callback_t' {aka 'void (*)(const struct device *, void *, unsigned int,  volatile void *)'} but argument is of type 'void (*)(void *, uint32_t,  volatile void *)' {aka 'void (*)(void *, unsigned int,  volatile void *)'}
+  166 |                                          ipm_callback_t cb, void *user_data)
+      |                                          ~~~~~~~~~~~~~~~^~
+[15/149] Building C object CMakeFiles/app.dir/home/neuberfran/d...pport/lib/rpmsg_lite/porting/environment/rpmsg_env_zephyr.c.obj
+FAILED: CMakeFiles/app.dir/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/environment/rpmsg_env_zephyr.c.obj 
+/home/neuberfran/zephyr-sdk-0.16.0/arm-zephyr-eabi/bin/arm-zephyr-eabi-gcc -DKERNEL -D__PROGRAM_START -D__ZEPHYR__=1 -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/drivers -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo/../../../../../../zephyr/samples/subsys/ipc/rpmsg_lite -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo/../../../../../../lib/include -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo/../../../../../../lib/include/platform/imx7d_m4 -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/include -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build/zephyr/include/generated -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/soc/arm/nxp_imx/mcimx7_m4 -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/modules/hal/cmsis/CMSIS/Core/Include -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/modules/hal/nxp/imx/drivers/. -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/modules/hal/nxp/imx/devices/. -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/modules/hal/nxp/imx/devices/MCIMX7D/. -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/modules/hal_nxp/. -isystem /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/lib/libc/minimal/include -isystem /home/neuberfran/zephyr-sdk-0.16.0/arm-zephyr-eabi/bin/../lib/gcc/arm-zephyr-eabi/12.2.0/include -isystem /home/neuberfran/zephyr-sdk-0.16.0/arm-zephyr-eabi/bin/../lib/gcc/arm-zephyr-eabi/12.2.0/include-fixed -fno-strict-aliasing -Os -imacros /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build/zephyr/include/generated/autoconf.h -ffreestanding -fno-common -g -gdwarf-4 -fdiagnostics-color=always -mcpu=cortex-m4 -mthumb -mabi=aapcs --sysroot=/home/neuberfran/zephyr-sdk-0.16.0/arm-zephyr-eabi/arm-zephyr-eabi -imacros /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/include/zephyr/toolchain/zephyr_stdint.h -Wall -Wformat -Wformat-security -Wno-format-zero-length -Wno-pointer-sign -Wpointer-arith -Wexpansion-to-defined -Wno-unused-but-set-variable -Werror=implicit-int -fno-pic -fno-pie -fno-asynchronous-unwind-tables -fno-reorder-functions --param=min-pagesize=0 -fno-defer-pop -fmacro-prefix-map=/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo=CMAKE_SOURCE_DIR -fmacro-prefix-map=/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr=ZEPHYR_BASE -fmacro-prefix-map=/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite=WEST_TOPDIR -ffunction-sections -fdata-sections -std=c99 -nostdinc -MD -MT CMakeFiles/app.dir/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/environment/rpmsg_env_zephyr.c.obj -MF CMakeFiles/app.dir/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/environment/rpmsg_env_zephyr.c.obj.d -o CMakeFiles/app.dir/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/environment/rpmsg_env_zephyr.c.obj -c /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/environment/rpmsg_env_zephyr.c
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/environment/rpmsg_env_zephyr.c: In function 'env_sleep_msec':
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/environment/rpmsg_env_zephyr.c:413:13: error: incompatible type for argument 1 of 'k_sleep'
+  413 |     k_sleep(num_msec);
+      |             ^~~~~~~~
+      |             |
+      |             int
+In file included from /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/include/zephyr/kernel.h:5956,
+                 from /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/environment/rpmsg_env_zephyr.c:47:
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build/zephyr/include/generated/syscalls/kernel.h:91:43: note: expected 'k_timeout_t' but argument is of type 'int'
+   91 | static inline int32_t k_sleep(k_timeout_t timeout)
+      |                               ~~~~~~~~~~~~^~~~~~~
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/environment/rpmsg_env_zephyr.c: In function 'env_put_queue':
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/environment/rpmsg_env_zephyr.c:577:57: error: incompatible type for argument 3 of 'k_msgq_put'
+  577 |         if (0 == k_msgq_put((struct k_msgq*)queue, msg, timeout_ms))
+      |                                                         ^~~~~~~~~~
+      |                                                         |
+      |                                                         int
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build/zephyr/include/generated/syscalls/kernel.h:1147:83: note: expected 'k_timeout_t' but argument is of type 'int'
+ 1147 | static inline int k_msgq_put(struct k_msgq * msgq, const void * data, k_timeout_t timeout)
+      |                                                                       ~~~~~~~~~~~~^~~~~~~
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/environment/rpmsg_env_zephyr.c: In function 'env_get_queue':
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/porting/environment/rpmsg_env_zephyr.c:601:57: error: incompatible type for argument 3 of 'k_msgq_get'
+  601 |         if (0 == k_msgq_get((struct k_msgq*)queue, msg, timeout_ms))
+      |                                                         ^~~~~~~~~~
+      |                                                         |
+      |                                                         int
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build/zephyr/include/generated/syscalls/kernel.h:1165:77: note: expected 'k_timeout_t' but argument is of type 'int'
+ 1165 | static inline int k_msgq_get(struct k_msgq * msgq, void * data, k_timeout_t timeout)
+      |                                                                 ~~~~~~~~~~~~^~~~~~~
+[17/149] Building C object CMakeFiles/app.dir/src/main_remote_echo.c.obj
+FAILED: CMakeFiles/app.dir/src/main_remote_echo.c.obj 
+/home/neuberfran/zephyr-sdk-0.16.0/arm-zephyr-eabi/bin/arm-zephyr-eabi-gcc -DKERNEL -D__PROGRAM_START -D__ZEPHYR__=1 -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/drivers -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo/../../../../../../zephyr/samples/subsys/ipc/rpmsg_lite -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo/../../../../../../lib/include -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo/../../../../../../lib/include/platform/imx7d_m4 -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/include -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build/zephyr/include/generated -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/soc/arm/nxp_imx/mcimx7_m4 -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/modules/hal/cmsis/CMSIS/Core/Include -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/modules/hal/nxp/imx/drivers/. -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/modules/hal/nxp/imx/devices/. -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/modules/hal/nxp/imx/devices/MCIMX7D/. -I/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/modules/hal_nxp/. -isystem /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/lib/libc/minimal/include -isystem /home/neuberfran/zephyr-sdk-0.16.0/arm-zephyr-eabi/bin/../lib/gcc/arm-zephyr-eabi/12.2.0/include -isystem /home/neuberfran/zephyr-sdk-0.16.0/arm-zephyr-eabi/bin/../lib/gcc/arm-zephyr-eabi/12.2.0/include-fixed -fno-strict-aliasing -Os -imacros /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build/zephyr/include/generated/autoconf.h -ffreestanding -fno-common -g -gdwarf-4 -fdiagnostics-color=always -mcpu=cortex-m4 -mthumb -mabi=aapcs --sysroot=/home/neuberfran/zephyr-sdk-0.16.0/arm-zephyr-eabi/arm-zephyr-eabi -imacros /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/include/zephyr/toolchain/zephyr_stdint.h -Wall -Wformat -Wformat-security -Wno-format-zero-length -Wno-pointer-sign -Wpointer-arith -Wexpansion-to-defined -Wno-unused-but-set-variable -Werror=implicit-int -fno-pic -fno-pie -fno-asynchronous-unwind-tables -fno-reorder-functions --param=min-pagesize=0 -fno-defer-pop -fmacro-prefix-map=/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo=CMAKE_SOURCE_DIR -fmacro-prefix-map=/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr=ZEPHYR_BASE -fmacro-prefix-map=/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite=WEST_TOPDIR -ffunction-sections -fdata-sections -std=c99 -nostdinc -MD -MT CMakeFiles/app.dir/src/main_remote_echo.c.obj -MF CMakeFiles/app.dir/src/main_remote_echo.c.obj.d -o CMakeFiles/app.dir/src/main_remote_echo.c.obj -c /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo/src/main_remote_echo.c
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo/src/main_remote_echo.c: In function 'main':
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo/src/main_remote_echo.c:104:62: error: incompatible type for argument 10 of 'k_thread_create'
+  104 |                         NULL, NULL, NULL, K_PRIO_COOP(7), 0, 0);
+      |                                                              ^
+      |                                                              |
+      |                                                              int
+In file included from /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/zephyr/include/zephyr/kernel.h:5956,
+                 from /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/remote_echo/src/main_remote_echo.c:6:
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build/zephyr/include/generated/syscalls/kernel.h:24:211: note: expected 'k_timeout_t' but argument is of type 'int'
+   24 | static inline k_tid_t k_thread_create(struct k_thread * new_thread, k_thread_stack_t * stack, size_t stack_size, k_thread_entry_t entry, void * p1, void * p2, void * p3, int prio, uint32_t options, k_timeout_t delay)
+      |                                                                                                                                                                                                       ~~~~~~~~~~~~^~~~~
+[20/149] Building C object CMakeFiles/app.dir/home/neuberfran/d...ueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/rpmsg_lite.c.obj
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/rpmsg_lite.c: In function 'rpmsg_lite_rx_callback':
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/rpmsg_lite.c:177:49: warning: taking address of packed member of 'struct rpmsg_std_hdr' may result in an unaligned pointer value [-Waddress-of-packed-member]
+  177 |             rsvd = (struct rpmsg_hdr_reserved *)&rpmsg_msg->hdr.reserved;
+      |                                                 ^~~~~~~~~~~~~~~~~~~~~~~~
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/rpmsg_lite.c: In function 'rpmsg_lite_alloc_tx_buffer':
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/rpmsg_lite.c:716:45: warning: taking address of packed member of 'struct rpmsg_std_hdr' may result in an unaligned pointer value [-Waddress-of-packed-member]
+  716 |     reserved = (struct rpmsg_hdr_reserved *)&rpmsg_msg->hdr.reserved;
+      |                                             ^~~~~~~~~~~~~~~~~~~~~~~~
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/rpmsg_lite.c: In function 'rpmsg_lite_send_nocopy':
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/rpmsg_lite.c:760:45: warning: taking address of packed member of 'struct rpmsg_std_hdr' may result in an unaligned pointer value [-Waddress-of-packed-member]
+  760 |     reserved = (struct rpmsg_hdr_reserved *)&rpmsg_msg->hdr.reserved;
+      |                                             ^~~~~~~~~~~~~~~~~~~~~~~~
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/rpmsg_lite.c: In function 'rpmsg_lite_release_rx_buffer':
+/home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/lib/rpmsg_lite/rpmsg_lite.c:801:45: warning: taking address of packed member of 'struct rpmsg_std_hdr' may result in an unaligned pointer value [-Waddress-of-packed-member]
+  801 |     reserved = (struct rpmsg_hdr_reserved *)&rpmsg_msg->hdr.reserved;
+      |                                             ^~~~~~~~~~~~~~~~~~~~~~~~
+[24/149] Building C object zephyr/CMakeFiles/zephyr.dir/lib/os/rb.c.obj
+ninja: build stopped: subcommand failed.
+FATAL ERROR: command exited with status 1: /usr/local/bin/cmake --build /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite/build
