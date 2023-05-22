@@ -1,6 +1,7 @@
 cd /home/neuberfran/diegosueiro/rpmsg-lite-zephyr-support/zephyr/samples/subsys/ipc/rpmsg_lite
 
 sudo rm -rf build/
+
 west build -p auto -b pico_pi_m4 remote_echo 
 
 -- west build: generating a build system
